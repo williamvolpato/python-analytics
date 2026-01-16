@@ -1,0 +1,291 @@
+from flask import Flask, request, jsonify
+from threading import Timer
+from twilio.rest import Client
+from twilio.base.exceptions import TwilioRestException
+from dotenv import load_dotenv
+from datetime import datetime
+import random
+import os
+import time
+import pytz
+import re
+
+load_dotenv()
+
+ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+FROM_PHONE = os.getenv("FROM_PHONE")
+
+app = Flask(__name__)
+client = Client(ACCOUNT_SID, AUTH_TOKEN)
+
+# ======================
+# Templates genéricos
+# ======================
+
+templates = [
+    "{name}, someone’s about to catch your 40% OFF! We dropped {product} from $49 to $29/bottle — next 5 minutes only! Hurry: {link} Reply STOP to unsubscribe.",
+    "Hey {name}, we dropped {product} from $49 to just $29/bottle — only for the next 5 minutes! Finish your order: {link} Reply STOP to unsubscribe.",
+    "{name}, we gave you an extra 40% OFF on {product}, from $49 down to $29/bottle! Finish your order now: {link} Reply STOP to unsubscribe.",
+    "Here’s an extra 40% OFF on your {product} bottles, {name}. $49 down to $29/bottle. Only for the next 10 people! Hurry: {link} Reply STOP to unsubscribe.",
+    "{name}, extra 40% OFF on the last bottles of {product}! From $49 to just $29/bottle. Hurry before someone grabs it: {link} Reply STOP to unsubscribe.",
+    "It’s official, {name}! 40% OFF {product}, but just for 4 more minutes. Lock in your special price here: {link} Reply STOP to unsubscribe.",
+    "Your cart is about to expire, {name}! Grab your {product} now with 40% OFF: only $29/bottle! Hurry: {link} Reply STOP to unsubscribe.",
+    "Surprise, {name}! Here’s 40% OFF for the last {product} bottles available. From $49 to $29/bottle! Grab yours before everyone else: {link} Reply STOP to unsubscribe."
+]
+
+sent_numbers = {}
+
+# ======================
+# Funções auxiliares
+# ======================
+
+def is_one_or_two_pack(title: str) -> bool:
+    """True se o título indicar 1 ou 2 frascos."""
+    t = (title or "").lower()
+    return bool(re.search(r'\b(1|2)\s*[- ]?\s*bottle(s)?\b', t))
+
+
+def get_bottle_qty(title: str):
+    """Tenta extrair a quantidade de frascos (1, 2, 3 ou 6) do título. Retorna int ou None."""
+    t = (title or "").lower()
+    m = re.search(r'\b(1|2|3|6)\s*[- ]?\s*bottle(s)?\b', t)
+    if m:
+        try:
+            return int(m.group(1))
+        except:
+            return None
+    return None
+
+
+def resolve_product_family(title: str) -> str:
+    """Retorna a família do produto."""
+    t = (title or "").lower()
+    if "pro" in t and "super" not in t:
+        return "matcha_pro"
+    if "super" in t:
+        return "super"
+    return "matcha"
+
+
+def product_display_name(family: str) -> str:
+    if family == "super":
+        return "Super Burn"
+    if family == "matcha_pro":
+        return "Matcha Burn PRO"
+    return "Matcha Burn"
+
+
+def _choose_src():
+    now = datetime.now(pytz.timezone("America/Sao_Paulo"))
+    hour = now.hour
+    return "will-sms" if 8 <= hour < 21 and random.random() < 0.35 else "blue-sms"
+
+
+# ======================
+# Links por produto
+# ======================
+
+def get_product_link(product_title):
+    family = resolve_product_family(product_title)
+    if family == "super":
+        return get_link_super(product_title)
+    elif family == "matcha_pro":
+        return get_link_matcha_pro(product_title)
+    else:
+        return get_link_matcha(product_title)
+
+
+def get_link_matcha(title):
+    """
+    Regras:
+    - Abandonou 1 ou 2 → 2 bottles (200789886)
+    - Abandonou 3 → 3 bottles
+    - Abandonou 6 → 6 bottles
+    - Caso contrário → home com src
+    """
+    src = _choose_src()
+    t = (title or "").lower()
+    qty = get_bottle_qty(t)
+
+    if qty in (1, 2):
+        return f"https://matchaburn.mycartpanda.com/checkout/200789886:1?src={src}"
+
+    if "2.0" in t:
+        if qty == 3:
+            return f"https://matchaburn.mycartpanda.com/checkout/191706083:1?src={src}"
+        elif qty == 6:
+            return f"https://matchaburn.mycartpanda.com/checkout/191706083:1?src={src}"
+    else:
+        if qty == 3:
+            return f"https://matchaburn.mycartpanda.com/checkout/187964754:1?src={src}"
+        elif qty == 6:
+            return f"https://matchaburn.mycartpanda.com/checkout/187964754:1?src={src}"
+
+    return f"https://matchaburn.mycartpanda.com/?src={src}"
+
+
+def get_link_super(title):
+    """
+    Regras:
+    - 1 ou 2 → 2 bottles (200789889)
+    - 3 → 3 bottles (199036577)
+    - 6 → 6 bottles (199036577)
+    - Senão → home
+    """
+    src = _choose_src()
+    t = (title or "").lower()
+    qty = get_bottle_qty(t)
+
+    if qty in (1, 2):
+        return f"https://matchaburn.mycartpanda.com/checkout/200789889:1?src={src}"
+    elif qty == 3:
+        return f"https://matchaburn.mycartpanda.com/checkout/199036577:1?src={src}"
+    elif qty == 6:
+        return f"https://matchaburn.mycartpanda.com/checkout/199036577:1?src={src}"
+    else:
+        return f"https://matchaburn.mycartpanda.com/?src={src}"
+
+
+def get_link_matcha_pro(title):
+    """
+    Regras:
+    - 1 ou 2 → 2 bottles (200789892)
+    - 3 → 3 bottles (200345743)
+    - 6 → 6 bottles (200345865)
+    - Senão → home
+    """
+    src = _choose_src()
+    t = (title or "").lower()
+    qty = get_bottle_qty(t)
+
+    if qty in (1, 2):
+        return f"https://matchaburn.mycartpanda.com/checkout/200789892:1?src={src}"
+    elif qty == 3:
+        return f"https://matchaburn.mycartpanda.com/checkout/200345743:1?src={src}"
+    elif qty == 6:
+        return f"https://matchaburn.mycartpanda.com/checkout/200345865:1?src={src}"
+    else:
+        return f"https://matchaburn.mycartpanda.com/?src={src}"
+
+
+# ======================
+# Envio via Twilio
+# ======================
+
+def is_valid_number(phone):
+    try:
+        number_info = client.lookups.v1.phone_numbers(phone).fetch(type=["carrier"])
+        if number_info.carrier and number_info.carrier.get('type') == 'voip':
+            print(f"[IGNORADO] Número VOIP: {phone}")
+            return False
+        return True
+    except TwilioRestException as e:
+        print(f"[IGNORADO] Número inválido ou erro no lookup ({phone}): {e}")
+        return False
+
+
+def enviar_sms(dados):
+    nome_completo = (dados.get("name") or "there").strip()
+    first_name = nome_completo.split(" ")[0]
+    phone = dados.get("phone")
+    product_title = (dados.get("product") or "").strip()
+
+    family = resolve_product_family(product_title)
+    product_name = product_display_name(family)
+    link = get_product_link(product_title)
+
+    mensagem = random.choice(templates).format(
+        name=first_name, product=product_name, link=link
+    )
+
+    try:
+        client.messages.create(
+            body=mensagem,
+            from_=FROM_PHONE,
+            to=phone
+        )
+        print(f"[ENVIADO] {first_name} - {phone} ({product_name})")
+    except TwilioRestException as e:
+        print(f"[ERRO TWILIO] {first_name} - {phone}: {e}")
+    except Exception as e:
+        print(f"[ERRO GERAL] {first_name} - {phone}: {e}")
+
+
+def format_phone(phone):
+    phone = ''.join(filter(str.isdigit, str(phone)))
+    if len(phone) == 10:
+        phone = "1" + phone
+    if not phone.startswith("1") or len(phone) != 11:
+        return None
+    return "+" + phone
+
+
+# ======================
+# Webhook
+# ======================
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    try:
+        payload = request.json
+        print(f"[RECEBIDO] {payload}")
+
+        if payload.get("event") != "abandoned.created":
+            return jsonify({"status": "ignorado", "motivo": "evento diferente"}), 200
+
+        data = payload.get("data", {})
+        customer = data.get("customer", {})
+        cart_items = data.get("cart_line_items", [])
+
+        if not customer or not cart_items:
+            return jsonify({"status": "erro", "motivo": "dados incompletos"}), 400
+
+        nome = f"{customer.get('first_name', '')} {customer.get('last_name', '')}".strip()
+        phone_raw = customer.get("phone", "")
+        product_title = (cart_items[0].get("variant", {}) or {}).get("title", "")
+
+        if not phone_raw:
+            return jsonify({"status": "erro", "motivo": "sem telefone"}), 400
+
+        phone = format_phone(phone_raw)
+        if not phone:
+            print(f"[IGNORADO] Número não-americano: {phone_raw}")
+            return jsonify({"status": "ignorado", "motivo": "número não-americano"}), 200
+
+        if not is_valid_number(phone):
+            return jsonify({"status": "ignorado", "motivo": "número inválido/voip"}), 200
+
+        now = time.time()
+        if phone in sent_numbers and now - sent_numbers[phone] < 86400:
+            print(f"[IGNORADO] Já enviado para {phone} nas últimas 24h")
+            return jsonify({"status": "ignorado", "motivo": "sms recente"}), 200
+
+        sent_numbers[phone] = now
+
+        dados_cliente = {
+            "name": nome,
+            "phone": phone,
+            "product": product_title
+        }
+
+        # Envia após 120s
+        Timer(120, enviar_sms, args=[dados_cliente]).start()
+        return jsonify({'status': 'ok'}), 200
+
+    except Exception as e:
+        print(f"[ERRO NO WEBHOOK] {e}")
+        return jsonify({"status": "erro interno"}), 500
+
+
+# ======================
+# Healthcheck
+# ======================
+
+@app.route('/')
+def home():
+    return "Servidor Flask rodando!", 200
+
+
+if __name__ == '__main__':
+    app.run(host="0.0.0.0", port=5000)
