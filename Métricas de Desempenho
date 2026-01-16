@@ -1,0 +1,118 @@
+import re
+
+import gspread
+import pandas as pd
+from google.auth import default
+from google.colab import auth
+from gspread_dataframe import set_with_dataframe
+
+
+SHEET_NAME = "Acompanhamento UPSELL/DOWNSELL"
+WORKSHEET_NAME = "Resumo Vendas"
+FILE_PATH = "/content/Planilha para Métricas.xlsx"
+SOURCE_SHEET = "Worksheet"
+
+
+def _to_float_series(series: pd.Series) -> pd.Series:
+    return series.astype(str).str.replace(",", "", regex=False).astype(float)
+
+
+def _extract_quantity_from_sku(sku: object) -> str:
+    match = re.search(r"\d+", str(sku))
+    return match.group(0) if match else "1"
+
+
+def build_summary(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    df["products_total"] = _to_float_series(df["products_total"])
+
+    is_ud = df["Product Name"].str.contains(r"UPSELL|DOWNSELL", case=False, na=False)
+    fronts = df[~is_ud].copy()
+    ud = df[is_ud].copy()
+
+    rows = []
+
+    for order_name in fronts["order_name"].unique():
+        front_orders = fronts[fronts["order_name"] == order_name]
+        related_ud = ud[ud["order_name"] == order_name]
+
+        for _, front_row in front_orders.iterrows():
+            front_name = front_row["Product Name"]
+            front_sales = 1
+            front_revenue = float(front_row["products_total"])
+
+            if related_ud.empty:
+                rows.append([front_name, front_sales, front_revenue, None, None, None, None])
+                continue
+
+            for _, ud_row in related_ud.iterrows():
+                quantity = _extract_quantity_from_sku(ud_row["SKU"])
+                ud_name = f"{ud_row['Product Name']} - ({quantity})"
+
+                ud_sales = 1
+                ud_revenue = float(ud_row["products_total"])
+                conversion_rate = (ud_sales / front_sales) * 100
+
+                rows.append([
+                    front_name,
+                    front_sales,
+                    front_revenue,
+                    ud_name,
+                    ud_sales,
+                    conversion_rate,
+                    ud_revenue,
+                ])
+
+    summary_df = pd.DataFrame(
+        rows,
+        columns=[
+            "Produto Front",
+            "Vendas",
+            "Valor em vendas do front",
+            "Upsell",
+            "Nº de vendas Upsell",
+            "% conversão",
+            "Valor vendas Upsell",
+        ],
+    )
+
+    grouped = (
+        summary_df.groupby(["Produto Front", "Upsell"], dropna=False)
+        .agg(
+            {
+                "Vendas": "sum",
+                "Valor em vendas do front": "sum",
+                "Nº de vendas Upsell": "sum",
+                "Valor vendas Upsell": "sum",
+            }
+        )
+        .reset_index()
+    )
+
+    grouped["% conversão"] = (grouped["Nº de vendas Upsell"] / grouped["Vendas"]) * 100
+    grouped["% conversão"] = grouped["% conversão"].fillna(0).round(2)
+
+    return grouped
+
+
+def get_worksheet(sheet_name: str, worksheet_name: str):
+    auth.authenticate_user()
+    creds, _ = default()
+    client = gspread.authorize(creds)
+    sh = client.open(sheet_name)
+    return sh.worksheet(worksheet_name)
+
+
+def main():
+    wks = get_worksheet(SHEET_NAME, WORKSHEET_NAME)
+
+    df = pd.read_excel(FILE_PATH, sheet_name=SOURCE_SHEET)
+    result = build_summary(df)
+
+    wks.clear()
+    set_with_dataframe(wks, result)
+
+
+if __name__ == "__main__":
+    main()
