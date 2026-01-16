@@ -1,0 +1,98 @@
+import gspread
+import pandas as pd
+from google.auth import default
+from google.colab import auth
+
+
+FILE_PATH = "/content/Relatorio_Reembolso.xlsx"
+SPREADSHEET_ID = "1QV50OpLqbYQVtfZuA1V2UimTy-eEFKXssIpWY4jDP94"
+WORKSHEET_NAME = "Devoluções Mensais"
+
+
+COLUMNS = [
+    "Data_Pedido",
+    "Produto",
+    "Chargeback_Date",
+    "Refund_Date",
+    "Status_Pagamento",
+    "Valor_Reembolsado",
+    "Preco_Item",
+    "ID_Pedido",
+    "Numero_Pedido",
+]
+
+
+def _to_float(series: pd.Series) -> pd.Series:
+    return series.astype(str).str.replace(",", ".", regex=False).astype(float)
+
+
+def _load_data(file_path: str) -> pd.DataFrame:
+    df = pd.read_excel(file_path)
+    df.columns = COLUMNS
+
+    df["Data_Pedido"] = pd.to_datetime(df["Data_Pedido"], errors="coerce")
+    df["Chargeback_Date"] = pd.to_datetime(df["Chargeback_Date"], errors="coerce")
+    df["Refund_Date"] = pd.to_datetime(df["Refund_Date"], errors="coerce")
+
+    df["Preco_Item"] = _to_float(df["Preco_Item"])
+    df["Valor_Reembolsado"] = _to_float(df["Valor_Reembolsado"])
+    df["Numero_Pedido"] = pd.to_numeric(df["Numero_Pedido"], errors="coerce")
+
+    return df
+
+
+def build_monthly_summary(df: pd.DataFrame) -> pd.DataFrame:
+    receita = (
+        df.groupby(df["Data_Pedido"].dt.to_period("M"))["Preco_Item"]
+        .sum()
+        .reset_index()
+        .rename(columns={"Data_Pedido": "Mes_Ano", "Preco_Item": "Receita"})
+    )
+    receita["Mes_Ano"] = receita["Mes_Ano"].astype(str)
+
+    df_chargeback = df[df["Status_Pagamento"].str.contains("Chargebacked", case=False, na=False)].copy()
+    chargeback = (
+        df_chargeback.groupby(df_chargeback["Data_Pedido"].dt.to_period("M"))["Preco_Item"]
+        .sum()
+        .reset_index()
+        .rename(columns={"Data_Pedido": "Mes_Ano", "Preco_Item": "Devolucao (Chargeback)"})
+    )
+    chargeback["Mes_Ano"] = chargeback["Mes_Ano"].astype(str)
+
+    df_refunds = df.drop_duplicates(subset=["Numero_Pedido"])
+    df_refunds = df_refunds[df_refunds["Status_Pagamento"].isin(["Refunded", "Partially Refunded"])].copy()
+    reembolso = (
+        df_refunds.groupby(df_refunds["Data_Pedido"].dt.to_period("M"))["Valor_Reembolsado"]
+        .sum()
+        .reset_index()
+        .rename(columns={"Data_Pedido": "Mes_Ano", "Valor_Reembolsado": "Devolucao (Reembolso)"})
+    )
+    reembolso["Mes_Ano"] = reembolso["Mes_Ano"].astype(str)
+
+    result = receita.merge(chargeback, on="Mes_Ano", how="left").merge(reembolso, on="Mes_Ano", how="left")
+    result = result.fillna(0)
+
+    result["Devolucao Total"] = result["Devolucao (Chargeback)"] + result["Devolucao (Reembolso)"]
+    result["% de Devoluções"] = (result["Devolucao Total"] / result["Receita"]) * 100
+
+    return result
+
+
+def update_google_sheet(df: pd.DataFrame, spreadsheet_id: str, worksheet_name: str) -> None:
+    auth.authenticate_user()
+    creds, _ = default()
+    client = gspread.authorize(creds)
+
+    wks = client.open_by_key(spreadsheet_id).worksheet(worksheet_name)
+    wks.clear()
+    wks.update([df.columns.values.tolist()] + df.values.tolist())
+
+
+def main() -> None:
+    df = _load_data(FILE_PATH)
+    summary = build_monthly_summary(df)
+    update_google_sheet(summary, SPREADSHEET_ID, WORKSHEET_NAME)
+
+
+if __name__ == "__main__":
+    main()
