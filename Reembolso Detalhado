@@ -1,0 +1,134 @@
+import os
+
+import pandas as pd
+from google.colab import drive
+
+
+INPUT_FILE_PATH = "/content/Relatorio_Reembolso.xlsx"
+OUTPUT_FOLDER = "/content/drive/My Drive/Relatorios_Reembolsos"
+
+COLUMNS = [
+    "Data_Pedido",
+    "Produto",
+    "Chargeback_Date",
+    "Refund_Date",
+    "Status_Pagamento",
+    "Valor_Reembolsado",
+    "Preco_Item",
+    "ID_Pedido",
+    "Numero_Pedido",
+]
+
+CATEGORIES = [
+    "1 a 7 dias",
+    "8 a 14 dias",
+    "15 a 21 dias",
+    "22 a 30 dias",
+    "1º mês",
+    "2º mês",
+    "Acima de 3 meses",
+]
+
+
+def _to_float(series: pd.Series) -> pd.Series:
+    return series.astype(str).str.replace(",", ".", regex=False).astype(float)
+
+
+def categorize_time_diff(days: float | int | None) -> str | None:
+    if pd.isna(days):
+        return None
+    if days <= 7:
+        return "1 a 7 dias"
+    if days <= 14:
+        return "8 a 14 dias"
+    if days <= 21:
+        return "15 a 21 dias"
+    if days <= 30:
+        return "22 a 30 dias"
+    if days <= 60:
+        return "1º mês"
+    if days <= 90:
+        return "2º mês"
+    return "Acima de 3 meses"
+
+
+def load_data(file_path: str) -> pd.DataFrame:
+    df = pd.read_excel(file_path)
+    df.columns = COLUMNS
+
+    df["Data_Pedido"] = pd.to_datetime(df["Data_Pedido"], errors="coerce")
+    df["Chargeback_Date"] = pd.to_datetime(df["Chargeback_Date"], errors="coerce")
+    df["Refund_Date"] = pd.to_datetime(df["Refund_Date"], errors="coerce")
+
+    df["Preco_Item"] = _to_float(df["Preco_Item"])
+    df["Valor_Reembolsado"] = _to_float(df["Valor_Reembolsado"])
+
+    df["Semana do Mês"] = (df["Data_Pedido"].dt.day // 7) + 1
+
+    df["Dias_Chargeback"] = (df["Chargeback_Date"] - df["Data_Pedido"]).dt.days
+    df["Dias_Refund"] = (df["Refund_Date"] - df["Data_Pedido"]).dt.days
+
+    df["Categoria_Chargeback"] = df["Dias_Chargeback"].apply(categorize_time_diff)
+    df["Categoria_Refund"] = df["Dias_Refund"].apply(categorize_time_diff)
+
+    return df
+
+
+def build_month_report(df_month: pd.DataFrame) -> pd.DataFrame:
+    df_chargebacks = df_month[df_month["Status_Pagamento"].str.contains("Chargebacked", case=False, na=False)]
+    df_refunds = (
+        df_month[df_month["Status_Pagamento"].isin(["Refunded", "Partially Refunded"])]
+        .drop_duplicates(subset=["Numero_Pedido"])
+    )
+
+    result = pd.DataFrame(columns=["Semana do Mês"] + CATEGORIES + ["Total Semana"])
+
+    for week in sorted(df_month["Semana do Mês"].dropna().unique()):
+        row = {"Semana do Mês": int(week)}
+
+        for category in CATEGORIES:
+            chargeback_value = df_chargebacks[
+                (df_chargebacks["Semana do Mês"] == week) & (df_chargebacks["Categoria_Chargeback"] == category)
+            ]["Preco_Item"].sum()
+
+            refund_value = df_refunds[
+                (df_refunds["Semana do Mês"] == week) & (df_refunds["Categoria_Refund"] == category)
+            ]["Valor_Reembolsado"].sum()
+
+            row[category] = float(chargeback_value + refund_value)
+
+        row["Total Semana"] = float(sum(row[c] for c in CATEGORIES))
+        result = pd.concat([result, pd.DataFrame([row])], ignore_index=True)
+
+    total_row = {"Semana do Mês": "Total Período"}
+    for category in CATEGORIES:
+        total_row[category] = float(result[category].sum() if len(result) else 0.0)
+    total_row["Total Semana"] = float(result["Total Semana"].sum() if len(result) else 0.0)
+
+    result = pd.concat([result, pd.DataFrame([total_row])], ignore_index=True)
+    return result
+
+
+def save_reports(df: pd.DataFrame, output_folder: str) -> str:
+    os.makedirs(output_folder, exist_ok=True)
+
+    for month in sorted(df["Data_Pedido"].dt.to_period("M").dropna().unique()):
+        df_month = df[df["Data_Pedido"].dt.to_period("M") == month]
+        report = build_month_report(df_month)
+
+        file_name = f"Relatorio_Reembolsos_{month}.csv"
+        out_path = os.path.join(output_folder, file_name)
+        report.to_csv(out_path, index=False, sep=";", decimal=",", encoding="utf-8")
+
+    return output_folder
+
+
+def main() -> None:
+    drive.mount("/content/drive")
+    df = load_data(INPUT_FILE_PATH)
+    output = save_reports(df, OUTPUT_FOLDER)
+    print(f"Relatórios salvos em: {output}")
+
+
+if __name__ == "__main__":
+    main()
